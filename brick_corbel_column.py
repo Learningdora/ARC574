@@ -13,10 +13,13 @@ The column leans outwards: every brick overhangs the brick below it by an amount
 The column is stable while BOTH of these hold at every bed joint k
 (the interface carrying the bricks at and above course k):
 
-  1. Strength  - the overturning moment does not exceed the mortar's capacity
+  1. Strength  - the net tensile stress at the heel of the joint does not
+     exceed the mortar's flexural tensile (bond) strength
        M = P * e                       (overturning moment, P = weight above)
-       Mr = tau_u * Z ,  Z = b * d^2/6  (resisting moment, section modulus)
-     i.e. the induced joint stress  M / Z <= tau_u  (ultimate shear strength).
+       Z = b * d^2/6 ,  A = b * d      (section modulus, joint area)
+       sigma_t = M / Z - P / A <= f_t  (the weight's compression offsets the
+                                        bending tension; no tension while
+                                        e <= d/6)
   2. Stability - the resultant of the weight above the joint stays over the
      supporting brick below (no overturning):
        e <= d / 2
@@ -37,10 +40,11 @@ internally for the SI solver):
     brickL:          Brick length - runs along the wall (bond direction) [mm]
     brickW:          Brick width - the wall thickness / overhang direction [mm]
     brickH:          Brick height [mm]
-    mortar_shear:    Ultimate shear strength of the mortar joint [Pa]
+    mortar_tensile:  Flexural tensile (bond) strength of the mortar joint [Pa],
+                     default 0.2e6 (typical range 0.1-0.4 MPa)
     n_courses:       Number of brick courses in the column (int)
     max_thickness_ratio:  Wall thickness cap in brick widths (default 3)
-    brick_density:   Brick density [kg/m3], default 2000
+    brick_density:   Brick density [kg/m3], default 700
     mortar_t:        Mortar bed joint thickness [mm], default 10
     max_overhang:    Cap on each brick's overhang in mm (default = brick width)
     bond_offset:     Lateral offset (mm) of the odd courses along the wall run
@@ -57,7 +61,8 @@ unit; angles and stress ratios are dimensionless):
     PerBrickX:       Horizontal (overhang) centre of each course [mm]
     Frames:          Rhino centre frame (plane) of each brick [mm]; the odd
                      courses are shifted by bond_offset along Y (running bond)
-    StressRatio:     Governing joint stress / ultimate shear strength (<= 1)
+    StressRatio:     Governing net tensile joint stress / flexural tensile
+                     strength (<= 1; 0 when every joint is fully compressed)
     GoverningJoint:  Index (course) of the governing joint
     Ok:              True if a stable lean was found
 """
@@ -78,6 +83,19 @@ def brick_weight(L, W, H, density=BRICK_DENSITY, g=G):
     return density * L * W * H * g
 
 
+def joint_stress(P, ecc, contact, width):
+    """Net tensile stress (Pa) at the heel of a bed joint.
+
+    Bending tension M/Z minus the compression P/A from the weight above,
+    clamped at 0 when the whole joint stays in compression (|e| <= d/6).
+    """
+    if contact <= 0.0 or width <= 0.0:
+        return float("inf")
+    A = width * contact
+    Z = width * contact * contact / 6.0
+    return max(P * abs(ecc) / Z - P / A, 0.0)
+
+
 def course_centres(delta, N):
     """Overhang-direction centre (x) of each course for a uniform overhang."""
     return [i * delta for i in range(N)]
@@ -87,80 +105,80 @@ def joint_results(delta, L, W, H, N, density=BRICK_DENSITY, g=G, bond_offset=0.0
     """Evaluate every bed joint for a uniform overhang delta.
 
     Joint k carries the bricks at and above course k (k = 0 is the base joint
-    under the first course, which has full contact depth L).  Returns a list
+    under the first course, which has full contact depth W).  Returns a list
     of dicts with P (weight above), e (eccentricity of its resultant from the
     joint centre), contact (overlap depth), moment, Z (section modulus) and the
-    induced shear stress.
+    net tensile stress.
 
     ``bond_offset`` shifts the odd courses along the wall face (Y) for a running
     bond, reducing the effective joint width (and hence the section modulus) at
     every intermediate joint by that amount.
     """
     Wb = brick_weight(L, W, H, density, g)
-    w_int = max(W - bond_offset, 0.0)     # bearing width at running-bond joints
+    w_int = max(L - bond_offset, 0.0)     # bearing width at running-bond joints
     res = []
     # Base joint under course 0 (full contact, no overhang on the host).
-    contact = L
+    contact = W
     ecc = delta * (N - 1) / 2.0
     P = N * Wb
-    Z = W * contact * contact / 6.0
+    Z = L * contact * contact / 6.0
     res.append(
         dict(k=0, P=P, ecc=ecc, contact=contact,
              moment=P * ecc, Z=Z,
-             stress=(P * ecc / Z) if Z else float("inf"))
+             stress=joint_stress(P, ecc, contact, L))
     )
     # Intermediate joints under course k (contact depth reduced by overhang).
     for k in range(1, N):
         n_above = N - k
-        contact = L - delta
+        contact = W - delta
         ecc = delta * n_above / 2.0
         P = n_above * Wb
         Z = w_int * contact * contact / 6.0 if contact > 0 else 0.0
         res.append(
             dict(k=k, P=P, ecc=ecc, contact=contact,
                  moment=P * ecc, Z=Z,
-                 stress=(P * ecc / Z) if Z else float("inf"))
+                 stress=joint_stress(P, ecc, contact, w_int))
         )
     return res
 
 
-def delta_feasible(delta, L, W, H, N, tau, density, g, max_thickness_ratio,
+def delta_feasible(delta, L, W, H, N, f_t, density, g, max_thickness_ratio,
                    max_overhang=None, bond_offset=0.0):
     """True if a uniform overhang delta keeps the column stable and within cap."""
     if delta < 0.0:
         return False
-    if delta >= L:                      # bricks no longer overlap
+    if delta >= W:                      # bricks no longer overlap
         return False
     if max_overhang is not None and delta > max_overhang:
         return False
     if N < 1:
         return False
     joints = joint_results(delta, L, W, H, N, density, g, bond_offset=bond_offset)
-    # Strength: induced joint stress must not exceed ultimate shear strength.
-    if max(j["stress"] for j in joints) > tau:
+    # Strength: net joint tension must not exceed flexural tensile strength.
+    if max(j["stress"] for j in joints) > f_t:
         return False
     # Stability: resultant of the weight above stays over the supporting brick.
     for j in joints:
         if j["ecc"] > j["contact"] / 2.0:
             return False
     # Wall thickness cap.
-    thickness = L + (N - 1) * delta
-    if thickness > max_thickness_ratio * L:
+    thickness = W + (N - 1) * delta
+    if thickness > max_thickness_ratio * W:
         return False
     return True
 
 
-def max_uniform_overhang(L, W, H, N, tau, density=BRICK_DENSITY, g=G,
+def max_uniform_overhang(L, W, H, N, f_t, density=BRICK_DENSITY, g=G,
                          max_thickness_ratio=3.0, max_overhang=None,
                          bond_offset=0.0, tol=1e-7):
     """Binary-search the largest uniform overhang that is still stable."""
-    cap = max_thickness_ratio * L
-    if cap <= L:
+    cap = max_thickness_ratio * W
+    if cap <= W:
         return dict(ok=False, reason="thickness cap smaller than brick depth",
                     delta=0.0)
     if N < 2:
         return dict(ok=False, reason="need at least 2 courses", delta=0.0)
-    hi = min(L * 0.999, (cap - L) / (N - 1))
+    hi = min(W * 0.999, (cap - W) / (N - 1))
     if max_overhang is not None:
         hi = min(hi, max_overhang)
     if hi <= 0.0:
@@ -169,7 +187,7 @@ def max_uniform_overhang(L, W, H, N, tau, density=BRICK_DENSITY, g=G,
     lo = 0.0
     for _ in range(200):
         mid = 0.5 * (lo + hi)
-        if delta_feasible(mid, L, W, H, N, tau, density, g, max_thickness_ratio,
+        if delta_feasible(mid, L, W, H, N, f_t, density, g, max_thickness_ratio,
                           max_overhang=max_overhang, bond_offset=bond_offset):
             lo = mid
         else:
@@ -177,7 +195,7 @@ def max_uniform_overhang(L, W, H, N, tau, density=BRICK_DENSITY, g=G,
     return dict(ok=True, delta=lo)
 
 
-def analyse(delta, L, W, H, N, tau, density=BRICK_DENSITY, g=G,
+def analyse(delta, L, W, H, N, f_t, density=BRICK_DENSITY, g=G,
             max_thickness_ratio=3.0, mortar_t=DEFAULT_MORTAR_T, t_m=None,
             bond_offset=0.0):
     """Full result set for a given uniform overhang."""
@@ -186,15 +204,15 @@ def analyse(delta, L, W, H, N, tau, density=BRICK_DENSITY, g=G,
     max_stress = max(j["stress"] for j in joints)
     governing = max(joints, key=lambda j: j["stress"])
     toppling_margin = min(j["contact"] / 2.0 - j["ecc"] for j in joints)
-    thickness = L + (N - 1) * delta
+    thickness = W + (N - 1) * delta
     centres = course_centres(delta, N)
     heights = [i * (H + t_m) + H / 2.0 for i in range(N)]
     angle = math.degrees(math.atan(delta / (H + t_m))) if (H + t_m) > 0 else 0.0
     return dict(
         delta=delta, joints=joints, max_stress=max_stress,
-        governing_joint=governing["k"], stress_ratio=max_stress / tau,
+        governing_joint=governing["k"], stress_ratio=max_stress / f_t,
         toppling_margin=toppling_margin, thickness=thickness,
-        thickness_cap=max_thickness_ratio * L,
+        thickness_cap=max_thickness_ratio * W,
         centres=centres, heights=heights, lean_angle=angle,
     )
 
@@ -216,28 +234,28 @@ def profile_joint_results(xs, L, W, H, density=BRICK_DENSITY, g=G, bond_offset=0
 
     ``xs`` are the course centres along the overhang direction.  Joint k carries
     the bricks at and above course k (k = 0 is the base joint under the first
-    course, with full contact depth L).  Returns the same fields as
-    ``joint_results`` (P, e, contact, moment, Z, induced stress).  ``bond_offset``
+    course, with full contact depth W).  Returns the same fields as
+    ``joint_results`` (P, e, contact, moment, Z, net tensile stress).  ``bond_offset``
     reduces the effective joint width at every intermediate (running-bond) joint.
     """
     N = len(xs)
     Wb = brick_weight(L, W, H, density, g)
-    w_int = max(W - bond_offset, 0.0)
+    w_int = max(L - bond_offset, 0.0)
     res = []
-    contact = L
+    contact = W
     ecc = sum(xs) / N
     P = N * Wb
-    Z = W * contact * contact / 6.0
+    Z = L * contact * contact / 6.0
     res.append(
         dict(k=0, P=P, ecc=ecc, contact=contact,
              moment=P * ecc, Z=Z,
-             stress=(P * ecc / Z) if Z else float("inf"))
+             stress=joint_stress(P, ecc, contact, L))
     )
     for k in range(1, N):
         n_above = N - k
         xbar = sum(xs[k:]) / n_above
         dk = xs[k] - xs[k - 1]
-        contact = L - dk
+        contact = W - dk
         cc = (xs[k - 1] + xs[k]) / 2.0
         ecc = xbar - cc
         P = n_above * Wb
@@ -245,31 +263,31 @@ def profile_joint_results(xs, L, W, H, density=BRICK_DENSITY, g=G, bond_offset=0
         res.append(
             dict(k=k, P=P, ecc=ecc, contact=contact,
                  moment=P * ecc, Z=Z,
-                 stress=(P * ecc / Z) if Z else float("inf"))
+                 stress=joint_stress(P, ecc, contact, w_int))
         )
     return res
 
 
-def profile_feasible(deltas, L, W, H, tau, density, g, cap, tol=1e-9,
+def profile_feasible(deltas, L, W, H, f_t, density, g, cap, tol=1e-9,
                      max_overhang=None, bond_offset=0.0):
     """True if a curved corbel profile is stable (strength/toppling/cap)."""
     xs = centres_from_deltas(deltas)
     joints = profile_joint_results(xs, L, W, H, density, g, bond_offset=bond_offset)
-    if max(j["stress"] for j in joints) > tau:
+    if max(j["stress"] for j in joints) > f_t:
         return False
     for j in joints:
         if j["ecc"] > j["contact"] / 2.0 + tol:
             return False
-    if any(d >= L for d in deltas[1:]):
+    if any(d >= W for d in deltas[1:]):
         return False
     if max_overhang is not None and any(d > max_overhang for d in deltas):
         return False
-    if L + (xs[-1] - xs[0]) > cap + 1e-9:
+    if W + (xs[-1] - xs[0]) > cap + 1e-9:
         return False
     return True
 
 
-def max_corbel_profile(L, W, H, N, tau, density=BRICK_DENSITY, g=G,
+def max_corbel_profile(L, W, H, N, f_t, density=BRICK_DENSITY, g=G,
                        max_thickness_ratio=3.0, max_overhang=None,
                        bond_offset=0.0, tol=1e-9):
     """Maximise the total lean with a curved (ogee) corbel profile.
@@ -279,8 +297,8 @@ def max_corbel_profile(L, W, H, N, tau, density=BRICK_DENSITY, g=G,
     below), then scales it back only as far as the strength, per-brick overhang
     and thickness-cap limits require.  Returns a per-course overhang vector.
     """
-    cap = max_thickness_ratio * L
-    if cap <= L:
+    cap = max_thickness_ratio * W
+    if cap <= W:
         return dict(ok=False, reason="thickness cap smaller than brick depth")
     if N < 2:
         return dict(ok=False, reason="need at least 2 courses")
@@ -293,7 +311,7 @@ def max_corbel_profile(L, W, H, N, tau, density=BRICK_DENSITY, g=G,
     weight = Wb
     cm = xs[N - 1]
     for k in range(N - 2, -1, -1):
-        xs[k] = cm - L / 2.0
+        xs[k] = cm - W / 2.0
         w2 = weight + Wb
         cm = (weight * cm + Wb * xs[k]) / w2
         weight = w2
@@ -304,7 +322,7 @@ def max_corbel_profile(L, W, H, N, tau, density=BRICK_DENSITY, g=G,
         return [0.0] + [s * d for d in shape[1:]]
 
     def feasible(s):
-        return profile_feasible(scaled(s), L, W, H, tau, density, g, cap, tol,
+        return profile_feasible(scaled(s), L, W, H, f_t, density, g, cap, tol,
                                 max_overhang=max_overhang, bond_offset=bond_offset)
 
     s = 1.0
@@ -320,7 +338,7 @@ def max_corbel_profile(L, W, H, N, tau, density=BRICK_DENSITY, g=G,
     return dict(ok=True, deltas=scaled(s))
 
 
-def analyse_profile(deltas, L, W, H, tau, density=BRICK_DENSITY, g=G,
+def analyse_profile(deltas, L, W, H, f_t, density=BRICK_DENSITY, g=G,
                     max_thickness_ratio=3.0, mortar_t=DEFAULT_MORTAR_T, t_m=None,
                     bond_offset=0.0):
     """Full result set for a curved corbel profile (per-course overhangs)."""
@@ -331,16 +349,16 @@ def analyse_profile(deltas, L, W, H, tau, density=BRICK_DENSITY, g=G,
     max_stress = max(j["stress"] for j in joints)
     governing = max(joints, key=lambda j: j["stress"])
     toppling_margin = min(j["contact"] / 2.0 - j["ecc"] for j in joints)
-    thickness = L + (xs[-1] - xs[0])
+    thickness = W + (xs[-1] - xs[0])
     heights = [i * (H + t_m) + H / 2.0 for i in range(N)]
     dx = xs[-1] - xs[0]
     dz = heights[-1] - heights[0]
     angle = math.degrees(math.atan2(dx, dz)) if dz > 0 else 0.0
     return dict(
         deltas=deltas, centres=xs, joints=joints, max_stress=max_stress,
-        governing_joint=governing["k"], stress_ratio=max_stress / tau,
+        governing_joint=governing["k"], stress_ratio=max_stress / f_t,
         toppling_margin=toppling_margin, thickness=thickness,
-        thickness_cap=max_thickness_ratio * L,
+        thickness_cap=max_thickness_ratio * W,
         heights=heights, lean_angle=angle,
     )
 
@@ -354,7 +372,7 @@ if __name__ == "__main__":
     brickL = globals().get("brickL", 190.0) * MM
     brickW = globals().get("brickW", 90.0) * MM
     brickH = globals().get("brickH", 57.0) * MM
-    mortar_shear = globals().get("mortar_shear", 1.0e6)
+    mortar_tensile = globals().get("mortar_tensile", 0.2e6)
     n_courses = globals().get("n_courses", 10)
     max_thickness_ratio = globals().get("max_thickness_ratio", 3.0)
     brick_density = globals().get("brick_density", BRICK_DENSITY)
@@ -379,13 +397,13 @@ if __name__ == "__main__":
     bond_offset = (0.5 * run_width if bo is None else float(bo) * MM)
 
     if int(profile) == 1:
-        res = max_corbel_profile(contact, run_width, brickH, n, mortar_shear,
+        res = max_corbel_profile(run_width, contact, brickH, n, mortar_tensile,
                                  density=brick_density,
                                  max_thickness_ratio=ratio,
                                  max_overhang=max_overhang,
                                  bond_offset=bond_offset)
     else:
-        res = max_uniform_overhang(contact, run_width, brickH, n, mortar_shear,
+        res = max_uniform_overhang(run_width, contact, brickH, n, mortar_tensile,
                                    density=brick_density,
                                    max_thickness_ratio=ratio,
                                    max_overhang=max_overhang,
@@ -402,14 +420,14 @@ if __name__ == "__main__":
         _reason = res["reason"]
     else:
         if int(profile) == 1:
-            analys = analyse_profile(res["deltas"], contact, run_width, brickH,
-                                     tau=mortar_shear, density=brick_density,
+            analys = analyse_profile(res["deltas"], run_width, contact, brickH,
+                                     f_t=mortar_tensile, density=brick_density,
                                      max_thickness_ratio=ratio, mortar_t=mortar_t,
                                      bond_offset=bond_offset)
             Overhangs = [d * M_TO_MM for d in analys["deltas"]]
         else:
-            analys = analyse(res["delta"], contact, run_width, brickH, n,
-                             mortar_shear, density=brick_density,
+            analys = analyse(res["delta"], run_width, contact, brickH, n,
+                             mortar_tensile, density=brick_density,
                              max_thickness_ratio=ratio, mortar_t=mortar_t,
                              bond_offset=bond_offset)
             Overhangs = [0.0] + [analys["delta"] * M_TO_MM] * (n - 1)
